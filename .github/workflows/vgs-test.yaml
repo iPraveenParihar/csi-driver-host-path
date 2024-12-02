@@ -1,0 +1,145 @@
+name: VGS test
+on:
+  workflow_dispatch:
+    inputs:
+      controller_image:
+        description: "Snapshot Controller Image"
+        required: false
+        default: "quay.io/madhupr001/snapshot-controller:latest"
+      sidecar_image:
+        description: "Snapshot sidecar Image"
+        required: false
+        default: "quay.io/madhupr001/csi-snapshotter:latest"
+      iterations:
+        description: "Number of iterations"
+        required: false
+        default: "20"
+
+jobs:
+  vgs-test:
+    name: VGS test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup tmate session
+        uses: mxschmitt/action-tmate@v3
+        with:
+          detached: true
+
+      - name: Check out the repo
+        uses: actions/checkout@v4
+
+      - name: Start minikube
+        uses: medyagh/setup-minikube@latest
+
+      - name: Deploy Snapshot Controller
+        run: |
+          SNAPSHOT_CONTROLLER_IMAGE=${{ github.event.inputs.controller_image }}
+          SNAPSHOTTER_URL=https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/24e5a53b16726287b0b9d78c345afd3a307cc585
+
+          # controller
+          SNAPSHOT_RBAC="${SNAPSHOTTER_URL}/deploy/kubernetes/snapshot-controller/rbac-snapshot-controller.yaml"
+          SNAPSHOT_CONTROLLER="${SNAPSHOTTER_URL}/deploy/kubernetes/snapshot-controller/setup-snapshot-controller.yaml"
+
+          # snapshot CRD
+          SNAPSHOTCLASS="${SNAPSHOTTER_URL}/client/config/crd/snapshot.storage.k8s.io_volumesnapshotclasses.yaml"
+          VOLUME_SNAPSHOT_CONTENT="${SNAPSHOTTER_URL}/client/config/crd/snapshot.storage.k8s.io_volumesnapshotcontents.yaml"
+          VOLUME_SNAPSHOT="${SNAPSHOTTER_URL}/client/config/crd/snapshot.storage.k8s.io_volumesnapshots.yaml"
+
+          # volumegroupsnapshot CRD
+          VOLUME_GROUP_SNAPSHOTCLASS="${SNAPSHOTTER_URL}/client/config/crd/groupsnapshot.storage.k8s.io_volumegroupsnapshotclasses.yaml"
+          VOLUME_GROUP_SNAPSHOT_CONTENT="${SNAPSHOTTER_URL}/client/config/crd/groupsnapshot.storage.k8s.io_volumegroupsnapshotcontents.yaml"
+          VOLUME_GROUP_SNAPSHOT="${SNAPSHOTTER_URL}/client/config/crd/groupsnapshot.storage.k8s.io_volumegroupsnapshots.yaml"
+
+          kubectl apply -f ${SNAPSHOTCLASS} -f ${VOLUME_SNAPSHOT_CONTENT} -f ${VOLUME_SNAPSHOT}
+          kubectl apply -f ${VOLUME_GROUP_SNAPSHOTCLASS} -f ${VOLUME_GROUP_SNAPSHOT_CONTENT} -f ${VOLUME_GROUP_SNAPSHOT}
+
+          temp_snap_controller=snapshot-controller.yaml
+          curl -o "${temp_snap_controller}" "${SNAPSHOT_CONTROLLER}"
+          image=$SNAPSHOT_CONTROLLER_IMAGE yq -i '.spec.template.spec.containers[] |= select(.name == "snapshot-controller").image = env(image)' "${temp_snap_controller}"
+          yq -i '.spec.template.spec.containers[] |= select(.name == "snapshot-controller").args += "--feature-gates=CSIVolumeGroupSnapshot=true"' "${temp_snap_controller}"
+
+          kubectl apply -f ${SNAPSHOT_RBAC} -f ${temp_snap_controller}
+
+      - name: Deploy csi-hostpath-driver
+        run: |
+          SNAPSHOT_SIDECAR_IMAGE=${{ github.event.inputs.sidecar_image }}
+          deploy/kubernetes-1.27/deploy.sh
+
+          kubectl wait --for=condition=Ready pod/csi-hostpathplugin-0
+
+          # patch sidecar
+          kubectl get statefulset csi-hostpathplugin -oyaml > statefulset.yaml
+          image=$SNAPSHOT_SIDECAR_IMAGE yq -i '.spec.template.spec.containers[] |= select(.name == "csi-snapshotter").image = env(image)' statefulset.yaml
+          yq -i '.spec.template.spec.containers[] |= select(.name == "csi-snapshotter").args += "--feature-gates=CSIVolumeGroupSnapshot=true"' statefulset.yaml
+          kubectl apply -f statefulset.yaml
+
+      - name: Run tests
+        run: |
+          # update the group snapshot class & group snapshot to v1beta1
+          yq -i '.apiVersion = "groupsnapshot.storage.k8s.io/v1beta1"' examples/csi-groupsnapshotclass-v1alpha1.yaml
+          yq -i '.apiVersion = "groupsnapshot.storage.k8s.io/v1beta1"' examples/csi-groupsnapshot-v1alpha1.yaml
+
+          # Create StorageClass, GroupSnapshotClass
+          kubectl apply -f examples/csi-storageclass.yaml
+          kubectl apply -f examples/csi-groupsnapshotclass-v1alpha1.yaml
+
+          # Add labels
+          yq -i '.metadata.labels += {"group": "test"}' examples/csi-pvc.yaml
+          yq -i '.metadata.labels += {"group": "test"}' examples/csi-restore.yaml
+          yq -i '.metadata.labels += {"group": "test"}' examples/csi-app.yaml
+
+          iterations=${{ github.event.inputs.iterations }}
+          for i in $(seq 1 $iterations); do
+            echo "Running Iteration: $i"
+
+            echo "Creating PVCs"
+            yq -i '.metadata.name = "pvc-1"' examples/csi-pvc.yaml
+            kubectl apply -f examples/csi-pvc.yaml
+            yq -i '.metadata.name = "pvc-2"' examples/csi-pvc.yaml
+            kubectl apply -f examples/csi-pvc.yaml
+            yq -i '.metadata.name = "pvc-3"' examples/csi-pvc.yaml
+            kubectl apply -f examples/csi-pvc.yaml
+
+            echo "Creating PODs"
+            yq -i '.metadata.name = "pod-1" | .spec.volumes[0].persistentVolumeClaim.claimName = "pvc-1"' examples/csi-app.yaml
+            kubectl apply -f examples/csi-app.yaml
+            yq -i '.metadata.name = "pod-2" | .spec.volumes[0].persistentVolumeClaim.claimName = "pvc-2"' examples/csi-app.yaml
+            kubectl apply -f examples/csi-app.yaml
+            yq -i '.metadata.name = "pod-3" | .spec.volumes[0].persistentVolumeClaim.claimName = "pvc-3"' examples/csi-app.yaml
+            kubectl apply -f examples/csi-app.yaml
+
+            echo "Waiting for pods to be ready"
+            kubectl wait --for=condition=Ready pod -l group=test --timeout=100s
+
+            echo "Creating VolumeGroupSnapshot"
+            yq -i '.spec.source.selector.matchLabels = {"group": "test"}' examples/csi-groupsnapshot-v1alpha1.yaml
+            yq -i '.metadata.name = "group-snap-1"' examples/csi-groupsnapshot-v1alpha1.yaml
+            kubectl apply -f examples/csi-groupsnapshot-v1alpha1.yaml
+            kubectl wait --for=jsonpath='{.status.readyToUse}'=true vgs/group-snap-1 --timeout=100s
+
+            echo "Restoring PVCs from snapshot"
+            vgsc=$(kubectl get vgs group-snap-1 -ojsonpath='{.status.boundVolumeGroupSnapshotContentName}')
+            VGSC_UID=$(kubectl get vgsc $vgsc -ojsonpath='{.metadata.uid}')
+            pairs=$(kubectl get vgsc $vgsc -o json | jq -c '.status.volumeSnapshotHandlePairList[]')
+
+            index=1
+            for pair in $pairs; do
+                volumeHandle=$(echo "$pair" | jq -r '.volumeHandle')
+                snapName=$(echo "snapshot-$(echo -n "$VGSC_UID$volumeHandle" | sha256sum | awk '{print $1}')")
+                pvcName="pvc-${index}-restore"
+                name="$pvcName" snap="$snapName" yq -i '.metadata.name = env(name) | .spec.dataSource.name = env(snap)' examples/csi-restore.yaml
+                kubectl apply -f examples/csi-restore.yaml
+
+                podName="pod-${index}-restore"
+                pName=$podName vName=$pvcName yq -i '.metadata.name = env(pName) | .spec.volumes[0].persistentVolumeClaim.claimName = env(vName)' examples/csi-app.yaml
+                kubectl apply -f examples/csi-app.yaml
+
+                index=$((index + 1))
+            done
+            kubectl wait --for=condition=Ready pod -l group=test --timeout=100s
+
+            echo "Deleting VolumeGroupSnapshots, PODs and PVCs"
+            kubectl delete vgs --all
+            kubectl delete pod -l group=test
+            kubectl delete pvc -l group=test
+          done
